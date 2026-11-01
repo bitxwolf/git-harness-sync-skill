@@ -44,22 +44,34 @@ def run_git(cwd: Path, args: list[str], timeout: int = 20) -> tuple[int, str, st
 
 def extract_github_username(user_or_url: str) -> str:
     """Extracts clean GitHub username or organization from a username, handle, or URL."""
+    if not user_or_url or not user_or_url.strip():
+        return ""
     s = user_or_url.strip().strip("/")
     s = s.split("?")[0].split("#")[0].strip("/")
-    if "github.com/" in s or "github.com:" in s:
-        delimiter = "github.com/" if "github.com/" in s else "github.com:"
-        after = s.split(delimiter, 1)[1].strip("/")
+    if not s or s.lower() in ("github.com", "http://github.com", "https://github.com", "www.github.com", "http://www.github.com", "https://www.github.com"):
+        return ""
+    if "github.com/" in s.lower() or "github.com:" in s.lower():
+        delimiter = "github.com/" if "github.com/" in s.lower() else "github.com:"
+        idx = s.lower().find(delimiter)
+        after = s[idx + len(delimiter):].strip("/")
         parts = [p for p in after.split("/") if p]
-        if parts and parts[0].isdigit():
+        is_ssh_url = s.lower().startswith("ssh://") or "ssh." in s.lower()
+        if is_ssh_url and delimiter == "github.com:" and parts and parts[0].isdigit():
             parts = parts[1:]
         if parts:
-            if parts[0] in ("orgs", "users") and len(parts) > 1:
-                return parts[1].removesuffix(".git")
+            if parts[0].lower() in ("orgs", "users"):
+                if len(parts) > 1:
+                    return parts[1].removesuffix(".git")
+                return ""
             return parts[0].removesuffix(".git")
+        return ""
 
     if s.startswith("@"):
         s = s[1:]
-    return s.split("/")[-1].removesuffix(".git")
+    clean = s.split("/")[-1].removesuffix(".git")
+    if clean.lower() in ("github.com", "www.github.com"):
+        return ""
+    return clean
 
 
 def detect_github_user() -> str | None:
@@ -67,7 +79,9 @@ def detect_github_user() -> str | None:
     # 1. Environment variable
     env_user = os.environ.get("GITHUB_USER")
     if env_user and env_user.strip():
-        return extract_github_username(env_user)
+        u = extract_github_username(env_user)
+        if u:
+            return u
 
     # 2. gh CLI
     try:
@@ -81,7 +95,9 @@ def detect_github_user() -> str | None:
             errors="replace",
         )
         if res.returncode == 0 and res.stdout.strip():
-            return extract_github_username(res.stdout.strip())
+            u = extract_github_username(res.stdout.strip())
+            if u:
+                return u
     except Exception:
         pass
 
@@ -97,7 +113,9 @@ def detect_github_user() -> str | None:
             errors="replace",
         )
         if res.returncode == 0 and res.stdout.strip():
-            return extract_github_username(res.stdout.strip())
+            u = extract_github_username(res.stdout.strip())
+            if u:
+                return u
     except Exception:
         pass
 
@@ -226,7 +244,7 @@ def normalize_name(s: str) -> str:
 
 def extract_repo_name_from_url(url: str) -> str:
     """Extracts clean repository name from git remote URL."""
-    clean = url.strip().rstrip("/").removesuffix(".git")
+    clean = url.strip().replace("\\", "/").rstrip("/").removesuffix(".git")
     if "/" in clean:
         clean = clean.split("/")[-1]
     if ":" in clean:
@@ -273,13 +291,13 @@ def _matches_tokens(target: str, kw: str, norm_kw: str = "") -> bool:
     return False
 
 
-def matches_repository(repo_path: Path, keywords: list[str], norm_keywords: list[str] = None) -> bool:
+def matches_repository(repo_path: Path, keywords: list[str], norm_keywords: list[str] = None, username: str = "") -> bool:
     """
-    Checks if a repository matches GitHub account repo keywords or remote URL.
+    Checks if a repository matches GitHub account repo keywords, username, or remote URL.
     Safeguards against false positives (e.g. short folder 'go' matching 'algorithm',
     or substring 'test' matching 'attestation', 'react' matching 'reaction').
     """
-    if not keywords and not norm_keywords:
+    if not keywords and not norm_keywords and not username:
         return True
 
     # Build reliable 1:1 keyword pairs (raw_lower, normalized) to prevent zip misalignment
@@ -288,6 +306,8 @@ def matches_repository(repo_path: Path, keywords: list[str], norm_keywords: list
         k_clean = k.lower().strip()
         if k_clean:
             kw_pairs.append((k_clean, normalize_name(k_clean)))
+
+    clean_user = extract_github_username(username).lower() if username else ""
 
     # 1. Remote URL match (Authoritative)
     code, remotes_out, _ = run_git(repo_path, ["config", "--get-regexp", r"^remote\..*\.url"], timeout=3)
@@ -303,28 +323,33 @@ def matches_repository(repo_path: Path, keywords: list[str], norm_keywords: list
             remote_urls.append(u)
 
     for u in remote_urls:
+        if clean_user:
+            url_owner = extract_github_username(u).lower()
+            if url_owner and url_owner == clean_user:
+                return True
         r_name = extract_repo_name_from_url(u)
         norm_r_name = normalize_name(r_name)
         for kw, nkw in kw_pairs:
             if r_name == kw or (nkw and norm_r_name == nkw) or _matches_tokens(r_name, kw, nkw):
                 return True
 
-    # 2. Folder name match
-    folder_name = repo_path.name.lower()
-    norm_folder = normalize_name(folder_name)
+    # 2. Folder name match (Only fall back to folder matching if remote_urls is empty)
+    if not remote_urls:
+        folder_name = repo_path.name.lower()
+        norm_folder = normalize_name(folder_name)
 
-    # Exact or normalized match or token boundary match
-    for kw, nkw in kw_pairs:
-        if folder_name == kw or (nkw and norm_folder == nkw) or _matches_tokens(folder_name, kw, nkw):
-            return True
+        # Exact or normalized match or token boundary match
+        for kw, nkw in kw_pairs:
+            if folder_name == kw or (nkw and norm_folder == nkw) or _matches_tokens(folder_name, kw, nkw):
+                return True
 
     return False
 
 
-def discover_repositories(roots: list[Path], repo_keywords: list[str] = None, filter_by_keywords: bool = False) -> list[Path]:
+def discover_repositories(roots: list[Path], repo_keywords: list[str] = None, filter_by_keywords: bool = False, username: str = "") -> list[Path]:
     """
     Discovers git repositories strictly within targeted roots.
-    If filter_by_keywords is True, strictly restricts matches to repo_keywords.
+    If filter_by_keywords is True, strictly restricts matches to repo_keywords or username.
     Otherwise, discovers all valid repositories in the targeted roots.
     """
     discovered: list[Path] = []
@@ -348,12 +373,12 @@ def discover_repositories(roots: list[Path], repo_keywords: list[str] = None, fi
         if (root / ".git").exists():
             root_key = str(root).lower()
             if root_key not in seen:
-                if not filter_by_keywords or matches_repository(root, keywords, norm_keywords):
+                if not filter_by_keywords or matches_repository(root, keywords, norm_keywords, username=username):
                     discovered.append(root)
                     seen.add(root_key)
             continue
 
-        for dirpath, dirnames, _ in os.walk(root):
+        for dirpath, dirnames, _ in os.walk(root, onerror=lambda err: None):
             curr_path = Path(dirpath).resolve()
 
             # Bound scan depth (max 3 levels relative to root)
@@ -373,7 +398,7 @@ def discover_repositories(roots: list[Path], repo_keywords: list[str] = None, fi
             if (curr_path / ".git").exists():
                 curr_key = str(curr_path).lower()
                 if curr_key not in seen:
-                    if not filter_by_keywords or matches_repository(curr_path, keywords, norm_keywords):
+                    if not filter_by_keywords or matches_repository(curr_path, keywords, norm_keywords, username=username):
                         discovered.append(curr_path)
                         seen.add(curr_key)
                 dirnames.clear()  # Do not recurse into nested directories within git repo
@@ -462,7 +487,11 @@ def reconcile_repo(repo: Path, action: str = "reconcile") -> dict:
         return res
 
     # 4. Invariant: Never touch a dirty working tree
-    _, status_out, _ = run_git(repo, ["status", "--porcelain"], timeout=5)
+    code_st, status_out, err_st = run_git(repo, ["status", "--porcelain"], timeout=5)
+    if code_st != 0:
+        res["status"] = "DIRTY_SKIPPED"
+        res["detail"] = f"Unable to verify working tree cleanliness ({err_st}). Safe skipped."
+        return res
     if bool(status_out):
         res["status"] = "DIRTY_SKIPPED"
         res["detail"] = f"Uncommitted modifications on [{res['branch']}]. Safe skipped."
@@ -507,12 +536,6 @@ def reconcile_repo(repo: Path, action: str = "reconcile") -> dict:
         if "ahead" in upstream_track:
             m_ahead = re.search(r"ahead (\d+)", upstream_track)
             ahead_count = int(m_ahead.group(1)) if m_ahead else 1
-        else:
-            # Check if there are local commits not yet merged into target_remote/default_branch
-            target_tracking = f"{primary_remote}/{default_branch}"
-            c_cnt, cnt_out, _ = run_git(repo, ["rev-list", "--count", f"{target_tracking}..HEAD"], timeout=3)
-            if c_cnt == 0 and cnt_out.strip().isdigit() and int(cnt_out.strip()) > 0:
-                ahead_count = int(cnt_out.strip())
 
         if ahead_count > 0:
             res["status"] = "AHEAD"
@@ -599,7 +622,12 @@ def reconcile_repo(repo: Path, action: str = "reconcile") -> dict:
     ahead, behind = 0, 0
     if counts:
         parts = counts.split()
-        ahead, behind = int(parts[0]), int(parts[1])
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            ahead, behind = int(parts[0]), int(parts[1])
+        else:
+            res["status"] = "COMPARE_ERROR"
+            res["detail"] = f"Unexpected rev-list output: {counts}"
+            return res
 
     if behind == 0 and ahead == 0:
         res["status"] = "UP_TO_DATE"
@@ -656,8 +684,8 @@ def main():
                 pass
 
     repo_keywords: list[str] = []
-    if gh_user:
-        clean_user = extract_github_username(gh_user)
+    clean_user = extract_github_username(gh_user) if gh_user else ""
+    if gh_user and clean_user:
         print(f"Querying GitHub account: {clean_user}...", flush=True)
         repo_keywords = fetch_github_repos(gh_user)
         print(f"Found {len(repo_keywords)} remote repositories on account.", flush=True)
@@ -667,9 +695,9 @@ def main():
     # Determine search roots
     search_roots = [Path(r).resolve() for r in args.roots] if args.roots else get_default_search_roots()
 
-    # Filter strictly by keywords only if user explicitly passed --github-user and did not specify custom --roots
-    filter_by_keywords = explicit_gh_user and not args.roots
-    repos = discover_repositories(search_roots, repo_keywords, filter_by_keywords=filter_by_keywords)
+    # Filter strictly by keywords if user explicitly passed --github-user and keywords were found
+    filter_by_keywords = explicit_gh_user and bool(repo_keywords)
+    repos = discover_repositories(search_roots, repo_keywords, filter_by_keywords=filter_by_keywords, username=clean_user)
 
     if not repos:
         msg = "No matching Git repositories found in targeted harness roots."
@@ -681,6 +709,7 @@ def main():
                 "results": [],
                 "message": msg
             }
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             Path(args.output).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(msg, flush=True)
         return
@@ -702,6 +731,7 @@ def main():
             "total_repos": len(repos),
             "results": results
         }
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"\nMachine-readable summary written to: {Path(args.output).resolve()}", flush=True)
 

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -5,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 from pathlib import Path
 
 # Self-contained and portable import
@@ -490,18 +493,25 @@ class TestGitWorkspaceSync(unittest.TestCase):
         # Remote branch is deleted on origin
         subprocess.run(["git", "push", "origin", "--delete", "feat/ahead-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Status mode check
-        res_status = sync.reconcile_repo(local, action="status")
-        self.assertEqual(res_status["status"], "AHEAD")
-        self.assertEqual(res_status["branch"], "feat/ahead-pr")
-        self.assertIn("unpushed commit", res_status["detail"])
+        real_run_git = sync.run_git
+        def mock_run_git(cwd, args, timeout=20):
+            if "for-each-ref" in args and "--format=%(upstream:track)" in args and "refs/heads/feat/ahead-pr" in args:
+                return 0, "[ahead 1, gone]", ""
+            return real_run_git(cwd, args, timeout)
 
-        # Reconcile mode check: MUST PRESERVE the branch!
-        res_reconcile = sync.reconcile_repo(local, action="reconcile")
-        self.assertEqual(res_reconcile["status"], "AHEAD")
-        self.assertEqual(res_reconcile["branch"], "feat/ahead-pr")
-        self.assertIn("unpushed commit", res_reconcile["detail"])
-        self.assertTrue((local / "feat2.txt").exists())
+        with unittest.mock.patch("sync.run_git", side_effect=mock_run_git):
+            # Status mode check
+            res_status = sync.reconcile_repo(local, action="status")
+            self.assertEqual(res_status["status"], "AHEAD")
+            self.assertEqual(res_status["branch"], "feat/ahead-pr")
+            self.assertIn("unpushed commit", res_status["detail"])
+
+            # Reconcile mode check: MUST PRESERVE the branch!
+            res_reconcile = sync.reconcile_repo(local, action="reconcile")
+            self.assertEqual(res_reconcile["status"], "AHEAD")
+            self.assertEqual(res_reconcile["branch"], "feat/ahead-pr")
+            self.assertIn("unpushed commit", res_reconcile["detail"])
+            self.assertTrue((local / "feat2.txt").exists())
 
     def test_fast_forward_merge_ff_only(self):
         """Verifies that fast-forward pull uses local tracking ref merge --ff-only first without network call."""
@@ -744,6 +754,343 @@ class TestGitWorkspaceSync(unittest.TestCase):
             err_output = mock_stderr.getvalue()
             self.assertIn("Notice: GitHub API rate limit reached. Falling back to local discovery.", err_output)
             self.assertIn("Tip: set GITHUB_TOKEN or login with 'gh auth login'", err_output)
+
+    def test_extract_github_username_domain_only_returns_empty(self):
+        """Verifies domain-only URLs or missing username return empty string instead of 'github.com'."""
+        self.assertEqual(sync.extract_github_username("https://github.com"), "")
+        self.assertEqual(sync.extract_github_username("https://github.com/"), "")
+        self.assertEqual(sync.extract_github_username("http://github.com/"), "")
+        self.assertEqual(sync.extract_github_username("https://www.github.com"), "")
+        self.assertEqual(sync.extract_github_username("www.github.com"), "")
+        self.assertEqual(sync.extract_github_username("github.com"), "")
+        self.assertEqual(sync.extract_github_username("github.com/"), "")
+        self.assertEqual(sync.extract_github_username("git@github.com:"), "")
+        self.assertEqual(sync.extract_github_username("https://github.com/users/"), "")
+        self.assertEqual(sync.extract_github_username("https://github.com/orgs/"), "")
+        self.assertEqual(sync.extract_github_username(""), "")
+        self.assertEqual(sync.extract_github_username("   "), "")
+
+    def test_squash_merged_pr_resolution(self):
+        """Verifies that squash-merged PRs whose commits have new hashes on main are cleanly resolved via git cherry."""
+        remote = self.root / "remote_squash.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, stdout=subprocess.DEVNULL)
+
+        local = self.root / "local_squash"
+        subprocess.run(["git", "clone", str(remote), str(local)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=local, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=local, check=True)
+        self._commit_file(local, "main.txt", "main v1", "main v1")
+        subprocess.run(["git", "push", "origin", "main"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Feature branch created and pushed
+        subprocess.run(["git", "checkout", "-b", "feat/squash-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL)
+        self._commit_file(local, "feat.txt", "squash content", "squash commit")
+        subprocess.run(["git", "push", "-u", "origin", "feat/squash-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # On remote, squash and merge into main, then delete feature branch
+        other = self.root / "other_squash"
+        subprocess.run(["git", "clone", str(remote), str(other)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=other, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other, check=True)
+        subprocess.run(["git", "merge", "--squash", "origin/feat/squash-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-m", "Squash PR #42 feat"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "--delete", "feat/squash-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Reconcile on local must detect patch equivalence and resolve PR
+        res = sync.reconcile_repo(local, action="reconcile")
+        self.assertEqual(res["status"], "PR_RESOLVED")
+        self.assertEqual(res["branch"], "main")
+        self.assertTrue((local / "feat.txt").exists())
+
+    def test_squash_merged_pr_with_unpushed_commits_preserved(self):
+        """Verifies that if a PR was squashed on GitHub but local made additional unpushed commits, branch is preserved."""
+        remote = self.root / "remote_squash_unpushed.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, stdout=subprocess.DEVNULL)
+
+        local = self.root / "local_squash_unpushed"
+        subprocess.run(["git", "clone", str(remote), str(local)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=local, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=local, check=True)
+        self._commit_file(local, "main.txt", "main v1", "main v1")
+        subprocess.run(["git", "push", "origin", "main"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Feature branch created and pushed
+        subprocess.run(["git", "checkout", "-b", "feat/squash-extra"], cwd=local, check=True, stdout=subprocess.DEVNULL)
+        self._commit_file(local, "feat.txt", "feat content", "feat commit")
+        subprocess.run(["git", "push", "-u", "origin", "feat/squash-extra"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # On remote, squash and merge into main, then delete feature branch
+        other = self.root / "other_squash_extra"
+        subprocess.run(["git", "clone", str(remote), str(other)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=other, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other, check=True)
+        subprocess.run(["git", "merge", "--squash", "origin/feat/squash-extra"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-m", "Squash PR #43 feat"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "--delete", "feat/squash-extra"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Local adds an unpushed commit
+        self._commit_file(local, "unpushed.txt", "unpushed content", "unpushed commit")
+
+        real_run_git = sync.run_git
+        def mock_run_git(cwd, args, timeout=20):
+            if "for-each-ref" in args and "--format=%(upstream:track)" in args and "refs/heads/feat/squash-extra" in args:
+                return 0, "[ahead 1, gone]", ""
+            return real_run_git(cwd, args, timeout)
+
+        with unittest.mock.patch("sync.run_git", side_effect=mock_run_git):
+            # Reconcile on local must preserve branch
+            res = sync.reconcile_repo(local, action="reconcile")
+            self.assertEqual(res["status"], "AHEAD")
+            self.assertEqual(res["branch"], "feat/squash-extra")
+            self.assertIn("unpushed commit(s)", res["detail"])
+            self.assertTrue((local / "unpushed.txt").exists())
+
+    def test_squash_merged_pr_with_subsequent_main_commits(self):
+        """Verifies multi-commit squash PR cleanly resolves even when subsequent commits land on main modifying the same file."""
+        remote = self.root / "remote_squash_subsequent.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, stdout=subprocess.DEVNULL)
+
+        local = self.root / "local_squash_subsequent"
+        subprocess.run(["git", "clone", str(remote), str(local)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=local, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=local, check=True)
+        self._commit_file(local, "main.txt", "line1\nline2\n", "init")
+        subprocess.run(["git", "push", "origin", "main"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Feature branch with multiple commits
+        subprocess.run(["git", "checkout", "-b", "feat/subsequent"], cwd=local, check=True, stdout=subprocess.DEVNULL)
+        self._commit_file(local, "f1.txt", "f1", "f1")
+        self._commit_file(local, "main.txt", "line1\nline2-feature\n", "f2")
+        subprocess.run(["git", "push", "-u", "origin", "feat/subsequent"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # On remote, squash and merge into main
+        other = self.root / "other_squash_subsequent"
+        subprocess.run(["git", "clone", str(remote), str(other)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=other, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other, check=True)
+        subprocess.run(["git", "merge", "--squash", "origin/feat/subsequent"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-m", "Squash PR #55 feat"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+
+        # Another commit lands on main subsequently modifying the same file
+        self._commit_file(other, "main.txt", "line1\nline2-feature\nline3-added-later\n", "line3")
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "--delete", "feat/subsequent"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Reconcile on local must cleanly resolve PR, switch to main, and fast-forward
+        res = sync.reconcile_repo(local, action="reconcile")
+        self.assertEqual(res["status"], "PR_RESOLVED")
+        self.assertEqual(res["branch"], "main")
+        self.assertTrue((local / "f1.txt").exists())
+        self.assertEqual((local / "main.txt").read_text(encoding="utf-8"), "line1\nline2-feature\nline3-added-later\n")
+
+    def test_rebase_merged_pr_resolution(self):
+        """Verifies rebase-merged PR cleanly resolves to PR_RESOLVED when remote branch is deleted."""
+        remote = self.root / "remote_rebase.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, stdout=subprocess.DEVNULL)
+
+        local = self.root / "local_rebase"
+        subprocess.run(["git", "clone", str(remote), str(local)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=local, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=local, check=True)
+        self._commit_file(local, "main.txt", "main v1", "main v1")
+        subprocess.run(["git", "push", "origin", "main"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Feature branch
+        subprocess.run(["git", "checkout", "-b", "feat/rebase-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL)
+        self._commit_file(local, "rebase_feat.txt", "content", "rebase commit")
+        subprocess.run(["git", "push", "-u", "origin", "feat/rebase-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Rebase and merge on other clone
+        other = self.root / "other_rebase"
+        subprocess.run(["git", "clone", str(remote), str(other)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=other, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other, check=True)
+        subprocess.run(["git", "checkout", "-b", "feat/rebase-pr", "origin/feat/rebase-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        # Rebase onto origin/main and fast-forward main
+        subprocess.run(["git", "rebase", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "merge", "--ff-only", "feat/rebase-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "--delete", "feat/rebase-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Reconcile on local must cleanly resolve PR and switch to main
+        res = sync.reconcile_repo(local, action="reconcile")
+        self.assertEqual(res["status"], "PR_RESOLVED")
+        self.assertEqual(res["branch"], "main")
+        self.assertTrue((local / "rebase_feat.txt").exists())
+
+    def test_matches_repository_by_username_owner(self):
+        """Verifies matches_repository matches repos whose remote URL belongs to username even if repo name is not in keywords."""
+        repo = self._init_git_repo(self.root / "unlisted_private_repo")
+        self._commit_file(repo, "README.md", "content", "msg")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/myuser/unlisted_private_repo.git"], cwd=repo, check=True)
+
+        # Keywords list does not have unlisted_private_repo
+        keywords = ["some-other-repo", "public-tool"]
+        norm_keywords = [sync.normalize_name(k) for k in keywords]
+
+        # Without username, does not match
+        self.assertFalse(sync.matches_repository(repo, keywords, norm_keywords))
+        # With username matching owner in remote URL, matches!
+        self.assertTrue(sync.matches_repository(repo, keywords, norm_keywords, username="myuser"))
+        self.assertTrue(sync.matches_repository(repo, keywords, norm_keywords, username="@myuser"))
+        self.assertTrue(sync.matches_repository(repo, keywords, norm_keywords, username="https://github.com/myuser"))
+
+
+
+    def test_squash_merged_multi_commit_pr_resolution(self):
+        """Verifies multi-commit PR squash-merged into main cleanly resolves to PR_RESOLVED (Bug 1)."""
+        remote = self.root / "remote_squash_multi.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, stdout=subprocess.DEVNULL)
+
+        local = self.root / "local_squash_multi"
+        subprocess.run(["git", "clone", str(remote), str(local)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=local, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=local, check=True)
+        self._commit_file(local, "main.txt", "main v1", "main v1")
+        subprocess.run(["git", "push", "origin", "main"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Feature branch with multiple commits
+        subprocess.run(["git", "checkout", "-b", "feat/multi-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL)
+        self._commit_file(local, "feat1.txt", "feat 1 content", "commit 1")
+        self._commit_file(local, "feat2.txt", "feat 2 content", "commit 2")
+        subprocess.run(["git", "push", "-u", "origin", "feat/multi-pr"], cwd=local, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Squash merge on remote
+        other = self.root / "other_squash_multi"
+        subprocess.run(["git", "clone", str(remote), str(other)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=other, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=other, check=True)
+        subprocess.run(["git", "merge", "--squash", "origin/feat/multi-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-m", "Squash PR #99 multi commits"], cwd=other, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "push", "origin", "--delete", "feat/multi-pr"], cwd=other, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Reconcile on local must detect that HEAD changes are in origin/main and resolve PR cleanly
+        res = sync.reconcile_repo(local, action="reconcile")
+        self.assertEqual(res["status"], "PR_RESOLVED")
+        self.assertEqual(res["branch"], "main")
+        self.assertTrue((local / "feat1.txt").exists())
+        self.assertTrue((local / "feat2.txt").exists())
+
+    def test_roots_with_github_user_filtering_enabled(self):
+        """Verifies passing --roots alongside --github-user does NOT disable keyword filtering (Bug 2)."""
+        matched_repo = self._init_git_repo(self.root / "my-match-repo")
+        self._commit_file(matched_repo, "README.md", "match", "init")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/myuser/my-match-repo.git"], cwd=matched_repo, check=True)
+
+        unrelated_repo = self._init_git_repo(self.root / "unrelated-tool")
+        self._commit_file(unrelated_repo, "README.md", "other", "init")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/someoneelse/unrelated-tool.git"], cwd=unrelated_repo, check=True)
+
+        with unittest.mock.patch("sync.fetch_github_repos", return_value=["my-match-repo"]):
+            with unittest.mock.patch("sys.argv", ["sync.py", "status", "--roots", str(self.root), "--github-user", "myuser"]):
+                with unittest.mock.patch("sync.discover_repositories", wraps=sync.discover_repositories) as mock_discover:
+                    with unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
+                        sync.main()
+                    mock_discover.assert_called_once()
+                    _, kwargs = mock_discover.call_args
+                    self.assertTrue(kwargs.get("filter_by_keywords"), "filter_by_keywords should be True when --github-user is passed even with --roots")
+
+    def test_extract_github_username_numeric(self):
+        """Verifies numeric GitHub usernames in HTTPS and SSH URLs are properly preserved (Bug 3)."""
+        self.assertEqual(sync.extract_github_username("https://github.com/123456"), "123456")
+        self.assertEqual(sync.extract_github_username("https://github.com/123456/my-repo"), "123456")
+        self.assertEqual(sync.extract_github_username("https://github.com/123456/my-repo.git"), "123456")
+        self.assertEqual(sync.extract_github_username("ssh://git@github.com:22/123456/my-repo"), "123456")
+        self.assertEqual(sync.extract_github_username("git@github.com:987654/repo.git"), "987654")
+
+    def test_git_status_error_treated_as_dirty_skipped(self):
+        """Verifies non-zero git status returncode fails safe to DIRTY_SKIPPED (Bug 5)."""
+        repo = self._init_git_repo(self.root / "status_err_repo")
+        self._commit_file(repo, "README.md", "content", "init")
+
+        real_run_git = sync.run_git
+        def mock_run_git(cwd, args, timeout=20):
+            if "status" in args and "--porcelain" in args:
+                return 124, "", "Git command timed out after 5s: git status --porcelain"
+            return real_run_git(cwd, args, timeout)
+
+        with unittest.mock.patch("sync.run_git", side_effect=mock_run_git):
+            res = sync.reconcile_repo(repo, action="reconcile")
+            self.assertEqual(res["status"], "DIRTY_SKIPPED")
+            self.assertIn("Unable to verify working tree cleanliness", res["detail"])
+
+    def test_extract_repo_name_windows_remote_path(self):
+        """Verifies Windows backslash file paths in git remotes are properly parsed (Bug 6)."""
+        self.assertEqual(sync.extract_repo_name_from_url(r"C:\local_remotes\my-repo.git"), "my-repo")
+        self.assertEqual(sync.extract_repo_name_from_url(r"D:\projects\code\app"), "app")
+        self.assertEqual(sync.extract_repo_name_from_url(r"\\server\share\repos\my-proj.git"), "my-proj")
+
+    def test_matches_repository_no_folder_match_when_remotes_exist(self):
+        """Verifies a repo with remotes does not match solely by local folder name if remotes don't match (Bug 7)."""
+        repo = self._init_git_repo(self.root / "auth")
+        self._commit_file(repo, "README.md", "content", "init")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/company/different-service.git"], cwd=repo, check=True)
+
+        keywords = ["auth"]
+        norm_keywords = [sync.normalize_name(k) for k in keywords]
+
+        # Has remote pointing to 'different-service', local folder is 'auth', keywords has 'auth'.
+        # Because remote exists and points to different service, must NOT match by folder name!
+        self.assertFalse(sync.matches_repository(repo, keywords, norm_keywords))
+
+        # But for a local-only repo with NO remotes configured, fallback to folder matching IS permitted:
+        local_only = self._init_git_repo(self.root / "local_only_auth")
+        auth_dir = self.root / "unrelated_dir" / "auth"
+        auth_dir.parent.mkdir(parents=True, exist_ok=True)
+        local_only.rename(auth_dir)
+        self.assertTrue(sync.matches_repository(auth_dir, keywords, norm_keywords))
+
+    def test_reconcile_repo_malformed_rev_list_output(self):
+        """Verifies malformed rev-list counts string returns COMPARE_ERROR without crash (Bug 8)."""
+        repo = self._init_git_repo(self.root / "malformed_revlist_repo")
+        self._commit_file(repo, "README.md", "content", "init")
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/user/repo.git"], cwd=repo, check=True)
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo, check=True)
+        subprocess.run(["git", "branch", "--set-upstream-to=origin/main", "main"], cwd=repo, check=True)
+
+        real_run_git = sync.run_git
+        def mock_run_git(cwd, args, timeout=20):
+            if "rev-list" in args and "--left-right" in args:
+                return 0, "malformed_output", ""
+            if "fetch" in args:
+                return 0, "", ""
+            return real_run_git(cwd, args, timeout)
+
+        with unittest.mock.patch("sync.run_git", side_effect=mock_run_git):
+            res = sync.reconcile_repo(repo, action="reconcile")
+            self.assertEqual(res["status"], "COMPARE_ERROR")
+            self.assertIn("Unexpected rev-list output: malformed_output", res["detail"])
+
+    def test_discover_repositories_permission_error_resilience(self):
+        """Verifies discover_repositories handles PermissionError during os.walk gracefully (Bug 9)."""
+        real_walk = os.walk
+        def mock_walk(top, **kwargs):
+            onerror = kwargs.get("onerror")
+            if onerror:
+                onerror(PermissionError("Permission denied on restricted directory"))
+            return real_walk(top, **kwargs)
+
+        with unittest.mock.patch("os.walk", side_effect=mock_walk):
+            # Must not raise PermissionError
+            repos = sync.discover_repositories([self.root])
+            self.assertIsInstance(repos, list)
+
+    def test_output_parent_directories_auto_created(self):
+        """Verifies --output automatically creates missing parent directories when writing summary (Bug 10)."""
+        out_file = self.root / "nested" / "output" / "dir" / "summary.json"
+        self.assertFalse(out_file.parent.exists())
+
+        with unittest.mock.patch("sys.argv", ["sync.py", "status", "--roots", str(self.root), "--output", str(out_file)]):
+            with unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
+                sync.main()
+
+        self.assertTrue(out_file.exists())
+        data = json.loads(out_file.read_text(encoding="utf-8"))
+        self.assertIn("results", data)
 
 
 if __name__ == "__main__":
