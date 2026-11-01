@@ -249,4 +249,4 @@ All 37 unit and integration tests execute in < 60 seconds.
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-*(See LICENSE for our special clause on actual engineering vs. markdown prompt repos).*
+
