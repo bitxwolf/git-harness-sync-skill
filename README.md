@@ -2,7 +2,7 @@
 
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg)](#dependencies)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#prerequisites)
-[![Test Coverage](https://img.shields.io/badge/tests-37%2F37%20passing-success.svg)](#testing)
+[![Test Coverage](https://img.shields.io/badge/tests-52%2F52%20passing-success.svg)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 [![Harness Agnostic](https://img.shields.io/badge/harness-Antigravity%20|%20Claude%20Code%20|%20Cursor%20|%20OpenHands%20|%20Aider-orange.svg)](#universal-agent-setup)
 
@@ -242,7 +242,7 @@ python -m unittest discover -s tests -v
 pytest tests/ -v
 ```
 
-All 37 unit and integration tests execute in < 60 seconds.
+All 52 unit and integration tests execute in < 60 seconds.
 
 ---
 
