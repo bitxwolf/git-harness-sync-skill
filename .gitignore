@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Environments & secrets
+.env
+.env.*
+*.secret
+*.token
+*.key
+*.pem
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
